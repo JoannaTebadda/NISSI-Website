@@ -1,4 +1,5 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type User } from '@supabase/supabase-js';
+import nodemailer from 'nodemailer';
 import { NextResponse } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
 
@@ -18,9 +19,23 @@ type CheckoutBody = {
 const cleanText = (value: unknown, max: number) => typeof value === 'string' ? value.trim().slice(0, max) : '';
 
 export async function POST(request: Request) {
-  const sessionClient = await createSupabaseServerClient();
-  if (!sessionClient) return NextResponse.json({ error: 'Supabase is not configured.' }, { status: 503 });
-  const { data: { user } } = await sessionClient.auth.getUser();
+  let user: User | null = null;
+  const authorization = request.headers.get('authorization');
+  if (authorization) {
+    const token = authorization.match(/^Bearer\s+(\S+)$/i)?.[1];
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const publishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    if (!token) return NextResponse.json({ error: 'AUTH_REQUIRED' }, { status: 401 });
+    if (!url || !publishableKey) return NextResponse.json({ error: 'Supabase is not configured.' }, { status: 503 });
+    const authClient = createClient(url, publishableKey, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
+    const { data } = await authClient.auth.getUser(token);
+    user = data.user;
+  } else {
+    const sessionClient = await createSupabaseServerClient();
+    if (!sessionClient) return NextResponse.json({ error: 'Supabase is not configured.' }, { status: 503 });
+    const { data } = await sessionClient.auth.getUser();
+    user = data.user;
+  }
   if (!user || !user.email) return NextResponse.json({ error: 'AUTH_REQUIRED' }, { status: 401 });
 
   let body: CheckoutBody;
@@ -69,21 +84,35 @@ export async function POST(request: Request) {
 
   // The order is already committed. Email errors are recorded but never undo the order.
   let emailStatus: 'sent' | 'failed' | 'not_configured' = 'not_configured';
-  const apiKey = process.env.MAILGUN_API_KEY;
-  const domain = process.env.MAILGUN_DOMAIN;
-  const from = process.env.MAILGUN_FROM_EMAIL;
+  const smtpHost = process.env.SMTP_HOST;
+  const smtpPort = Number(process.env.SMTP_PORT || 587);
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPassword = process.env.SMTP_PASS;
+  const from = process.env.MAIL_FROM_EMAIL || process.env.MAILGUN_FROM_EMAIL;
   const { data: items } = await admin.from('order_items').select('product_name,variant_name,quantity,unit_price_ugx,line_total_ugx').eq('order_id', order.id);
-  if (apiKey && domain && from) {
+  const summary = (items || []).map(item => `${item.product_name} — ${item.variant_name} × ${item.quantity}: UGX ${new Intl.NumberFormat('en-UG').format(item.line_total_ugx)}`).join('\n');
+  const message = `Thank you for ordering from NISSI.\n\nOrder: ${order.order_number}\n\n${summary}\n\nTotal: UGX ${new Intl.NumberFormat('en-UG').format(order.total_ugx)} plus delivery (fee confirmed after order)\nPayment: ${method === 'cash_on_delivery' ? 'Cash on delivery' : 'MTN MoMo sandbox demo — pending, no real payment taken'}\nDelivery: ${district}, ${city}\nAddress: ${address}\n\nWe will contact you to confirm delivery details.`;
+  if (smtpHost && smtpUser && smtpPassword && from) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure: process.env.SMTP_SECURE === 'true' || smtpPort === 465,
+        auth: { user: smtpUser, pass: smtpPassword },
+      });
+      await transporter.sendMail({ from, to: user.email, subject: `NISSI order ${order.order_number} received`, text: message });
+      emailStatus = 'sent';
+    } catch { emailStatus = 'failed'; }
+  } else if (process.env.MAILGUN_API_KEY && process.env.MAILGUN_DOMAIN && process.env.MAILGUN_FROM_EMAIL) {
     try {
       const form = new URLSearchParams();
-      form.set('from', from);
+      form.set('from', process.env.MAILGUN_FROM_EMAIL);
       form.set('to', user.email);
       form.set('subject', `NISSI order ${order.order_number} received`);
-      const summary = (items || []).map(item => `${item.product_name} — ${item.variant_name} × ${item.quantity}: UGX ${new Intl.NumberFormat('en-UG').format(item.line_total_ugx)}`).join('\n');
-      form.set('text', `Thank you for ordering from NISSI.\n\nOrder: ${order.order_number}\n\n${summary}\n\nTotal: UGX ${new Intl.NumberFormat('en-UG').format(order.total_ugx)} plus delivery (fee confirmed after order)\nPayment: ${method === 'cash_on_delivery' ? 'Cash on delivery' : 'MTN MoMo sandbox demo — pending, no real payment taken'}\nDelivery: ${district}, ${city}\nAddress: ${address}\n\nWe will contact you to confirm delivery details.`);
-      const result = await fetch(`https://api.mailgun.net/v3/${encodeURIComponent(domain)}/messages`, {
+      form.set('text', message);
+      const result = await fetch(`https://api.mailgun.net/v3/${encodeURIComponent(process.env.MAILGUN_DOMAIN)}/messages`, {
         method: 'POST',
-        headers: { Authorization: `Basic ${Buffer.from(`api:${apiKey}`).toString('base64')}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: { Authorization: `Basic ${Buffer.from(`api:${process.env.MAILGUN_API_KEY}`).toString('base64')}`, 'Content-Type': 'application/x-www-form-urlencoded' },
         body: form,
       });
       emailStatus = result.ok ? 'sent' : 'failed';

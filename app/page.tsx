@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronDown, Flame, Leaf, Menu, Minus, Plus, ShoppingBag, X } from 'lucide-react';
 import { money, products, variants, type Product } from '@/lib/catalog';
+import { createSupabaseBrowserClient } from '@/lib/supabase/browser';
 
 type CartLine = { variantId: string; quantity: number };
 const categories = ['All products', 'Briquettes', 'Pellets', 'Stoves', 'Accessories'];
@@ -19,10 +20,91 @@ export default function Home() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [checkoutError, setCheckoutError] = useState('');
+  const [cartSyncMessage, setCartSyncMessage] = useState('');
+  const cartRef = useRef<CartLine[]>([]);
+  const remoteCartId = useRef<string | null>(null);
+  const supabaseRef = useRef<ReturnType<typeof createSupabaseBrowserClient>>(null);
 
-  useEffect(() => { try { const raw = localStorage.getItem('nissi-cart'); if (raw) setCart(JSON.parse(raw)); } catch { /* Start with an empty cart if stored data is invalid. */ } setReady(true); }, []);
-  useEffect(() => { if (ready) localStorage.setItem('nissi-cart', JSON.stringify(cart)); }, [cart, ready]);
+  useEffect(() => {
+    let active = true;
+    let channel: ReturnType<NonNullable<typeof supabaseRef.current>['channel']> | null = null;
+    const readLocalCart = (): CartLine[] => {
+      try {
+        const raw = localStorage.getItem('nissi-cart');
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed.filter((line): line is CartLine => typeof line?.variantId === 'string' && Number.isInteger(line?.quantity) && line.quantity > 0 && line.quantity <= 100) : [];
+      } catch { return []; }
+    };
+    const publish = (next: CartLine[]) => { cartRef.current = next; setCart(next); };
+    const loadRemote = async (client: NonNullable<typeof supabaseRef.current>, cartId: string) => {
+      const { data, error } = await client.from('cart_items').select('variant_slug,quantity').eq('cart_id', cartId);
+      if (error) throw error;
+      const fresh = (data || []).map(row => ({ variantId: row.variant_slug, quantity: row.quantity }));
+      if (active) publish(fresh);
+    };
+    const syncDelta = async (client: NonNullable<typeof supabaseRef.current>, cartId: string, before: CartLine[], after: CartLine[]) => {
+      const removed = before.filter(old => !after.some(line => line.variantId === old.variantId)).map(line => line.variantId);
+      if (removed.length) {
+        const { error } = await client.from('cart_items').delete().eq('cart_id', cartId).in('variant_slug', removed);
+        if (error) throw error;
+      }
+      const changed = after.filter(line => before.find(old => old.variantId === line.variantId)?.quantity !== line.quantity);
+      if (changed.length) {
+        const { error } = await client.from('cart_items').upsert(changed.map(line => ({ cart_id: cartId, variant_slug: line.variantId, quantity: line.quantity })), { onConflict: 'cart_id,variant_slug' });
+        if (error) throw error;
+      }
+    };
+    const initialize = async () => {
+      const local = readLocalCart();
+      const client = createSupabaseBrowserClient();
+      supabaseRef.current = client;
+      if (client) {
+        const { data: { user } } = await client.auth.getUser();
+        if (!active) return;
+        if (user) {
+          const { data: cartRow, error: cartError } = await client.from('carts').upsert({ user_id: user.id }, { onConflict: 'user_id' }).select('id').single();
+          if (cartError) throw cartError;
+          remoteCartId.current = cartRow.id;
+          const { data, error } = await client.from('cart_items').select('variant_slug,quantity').eq('cart_id', cartRow.id);
+          if (error) throw error;
+          const remote = (data || []).map(row => ({ variantId: row.variant_slug, quantity: row.quantity }));
+          const merged = [...remote];
+          for (const line of local) {
+            const current = merged.find(item => item.variantId === line.variantId);
+            if (current) current.quantity = Math.min(100, current.quantity + line.quantity);
+            else merged.push(line);
+          }
+          publish(merged);
+          localStorage.removeItem('nissi-cart');
+          if (local.length) await syncDelta(client, cartRow.id, remote, merged);
+          channel = client.channel(`nissi-cart-${cartRow.id}`).on('postgres_changes', { event: '*', schema: 'public', table: 'cart_items', filter: `cart_id=eq.${cartRow.id}` }, () => { void loadRemote(client, cartRow.id).catch(() => active && setCartSyncMessage('Cart sync paused. Check your connection and reload to try again.')); }).subscribe(status => {
+            if (status === 'SUBSCRIBED' && active) setCartSyncMessage('Your bag syncs with your other signed-in devices.');
+            if (status === 'CHANNEL_ERROR' && active) setCartSyncMessage('Live cart sync is unavailable. Check the Supabase setup.');
+          });
+        } else publish(local);
+      } else publish(local);
+      if (active) setReady(true);
+    };
+    void initialize().catch(() => {
+      if (active) { publish(readLocalCart()); setCartSyncMessage('Shared cart setup is not ready yet.'); setReady(true); }
+    });
+    return () => { active = false; if (channel && supabaseRef.current) void supabaseRef.current.removeChannel(channel); };
+  }, []);
+  useEffect(() => { if (ready && !remoteCartId.current) localStorage.setItem('nissi-cart', JSON.stringify(cart)); }, [cart, ready]);
   useEffect(() => { const params = new URLSearchParams(window.location.search); if (params.get('checkout') === '1') { setCheckoutOpen(true); window.history.replaceState({}, '', window.location.pathname); } }, []);
+
+  function updateCart(change: (current: CartLine[]) => CartLine[]) {
+    const before = cartRef.current;
+    const after = change(before).map(line => ({ ...line, quantity: Math.max(1, Math.min(100, line.quantity)) }));
+    cartRef.current = after;
+    setCart(after);
+    if (remoteCartId.current && supabaseRef.current) {
+      void (async () => {
+        try { await syncRemoteCart(supabaseRef.current!, remoteCartId.current!, before, after); setCartSyncMessage('Your bag syncs with your other signed-in devices.'); }
+        catch { setCartSyncMessage('Could not sync that change. Check your connection and try again.'); }
+      })();
+    }
+  }
 
   const lines = useMemo(() => cart.flatMap(line => { const match = variants.find(v => v.id === line.variantId); return match ? [{ ...match, quantity: line.quantity }] : []; }), [cart]);
   const count = lines.reduce((n,line) => n + line.quantity,0);
@@ -30,11 +112,12 @@ export default function Home() {
   const shown = category === 'All products' ? products : products.filter(product => product.category === category);
 
   function add(product: Product) {
+    if (!ready) return;
     const variantId = selected[product.slug] || product.variants[0].id;
-    setCart(prev => { const current = prev.find(line => line.variantId === variantId); if (current) return prev.map(line => line.variantId === variantId ? { ...line, quantity: Math.min(100, line.quantity + 1) } : line); return [...prev, { variantId, quantity: 1 }]; });
+    updateCart(prev => { const current = prev.find(line => line.variantId === variantId); if (current) return prev.map(line => line.variantId === variantId ? { ...line, quantity: Math.min(100, line.quantity + 1) } : line); return [...prev, { variantId, quantity: 1 }]; });
     setAdded(product.slug); window.setTimeout(() => setAdded(null), 1300);
   }
-  function setQuantity(id: string, quantity: number) { setCart(prev => quantity < 1 ? prev.filter(line => line.variantId !== id) : prev.map(line => line.variantId === id ? { ...line, quantity: Math.min(100, quantity) } : line)); }
+  function setQuantity(id: string, quantity: number) { updateCart(prev => quantity < 1 ? prev.filter(line => line.variantId !== id) : prev.map(line => line.variantId === id ? { ...line, quantity: Math.min(100, quantity) } : line)); }
   async function beginCheckout() {
     setCartOpen(false);
     const supabase = (await import('@/lib/supabase/browser')).createSupabaseBrowserClient();
@@ -59,7 +142,7 @@ export default function Home() {
       const result = await response.json();
       if (response.status === 401) { window.location.assign('/auth?next=%2F%3Fcheckout%3D1'); return; }
       if (!response.ok) { setCheckoutError(result.error || 'We could not place your order. Please try again.'); return; }
-      setCart([]);
+      updateCart(() => []);
       setCheckoutOpen(false);
       window.location.assign(`/account?placed=${encodeURIComponent(result.order_number)}`);
     } catch {
@@ -87,7 +170,7 @@ export default function Home() {
     <section className="closing"><span className="eyebrow"><span className="dot"/> YOUR KITCHEN, YOUR WAY</span><h2>Here’s to the good<br/>things <em>cooking.</em></h2><a href="#shop" className="button button-light">Find your fit <ArrowRight size={16}/></a><span className="closing-spark">✳</span></section>
     <footer><a className="wordmark" href="#home">nissi<span>.</span></a><p>Good energy for good living.<br/>Made with care in Uganda.</p><div className="footer-links"><a href="#shop">Shop</a><a href="#story">Our story</a><a href="mailto:hello@nissi.ug">Get in touch</a></div><span className="copyright">© NISSI 2026 &nbsp;·&nbsp; UGANDA</span></footer>
 
-    {cartOpen&&<div className="overlay" onClick={()=>setCartOpen(false)}><aside className="drawer" onClick={e=>e.stopPropagation()}><div className="drawer-head"><div><span className="tiny-label">YOUR SELECTION</span><h2>Your bag <span>({count})</span></h2></div><button className="icon-button" onClick={()=>setCartOpen(false)} aria-label="Close bag"><X/></button></div>{lines.length===0?<div className="empty-cart"><span className="empty-icon"><ShoppingBag/></span><h3>A little room for good things.</h3><p>Your bag is waiting for something lovely.</p><button className="button button-dark" onClick={()=>setCartOpen(false)}>Explore the collection <ArrowRight size={15}/></button></div>:<><div className="cart-lines">{lines.map(line=><div className="cart-line" key={line.id}><div className={`cart-thumb ${line.product.tone}`}>{line.product.symbol}</div><div className="cart-info"><strong>{line.product.name}</strong><span>{line.name}</span><div className="quantity"><button onClick={()=>setQuantity(line.id,line.quantity-1)} aria-label="Decrease quantity"><Minus size={13}/></button><span>{line.quantity}</span><button onClick={()=>setQuantity(line.id,line.quantity+1)} aria-label="Increase quantity"><Plus size={13}/></button></div></div><div className="cart-price"><strong>{money(line.price*line.quantity)}</strong><button onClick={()=>setQuantity(line.id,0)}>Remove</button></div></div>)}</div><div className="drawer-foot"><div className="subtotal-row"><span>Subtotal</span><strong>{money(subtotal)}</strong></div><p>Delivery fee confirmed after your order. No delivery date is promised at checkout.</p><button className="button button-dark full-button" onClick={beginCheckout}>Continue to checkout <ArrowRight size={16}/></button><span className="secure-note">Secure checkout · Payment due on delivery</span></div></>}</aside></div>}
+    {cartOpen&&<div className="overlay" onClick={()=>setCartOpen(false)}><aside className="drawer" onClick={e=>e.stopPropagation()}><div className="drawer-head"><div><span className="tiny-label">YOUR SELECTION</span><h2>Your bag <span>({count})</span></h2></div><button className="icon-button" onClick={()=>setCartOpen(false)} aria-label="Close bag"><X/></button></div>{cartSyncMessage&&<p className="cart-sync-message" role="status">{cartSyncMessage}</p>}{lines.length===0?<div className="empty-cart"><span className="empty-icon"><ShoppingBag/></span><h3>A little room for good things.</h3><p>Your bag is waiting for something lovely.</p><button className="button button-dark" onClick={()=>setCartOpen(false)}>Explore the collection <ArrowRight size={15}/></button></div>:<><div className="cart-lines">{lines.map(line=><div className="cart-line" key={line.id}><div className={`cart-thumb ${line.product.tone}`}>{line.product.symbol}</div><div className="cart-info"><strong>{line.product.name}</strong><span>{line.name}</span><div className="quantity"><button onClick={()=>setQuantity(line.id,line.quantity-1)} aria-label="Decrease quantity"><Minus size={13}/></button><span>{line.quantity}</span><button onClick={()=>setQuantity(line.id,line.quantity+1)} aria-label="Increase quantity"><Plus size={13}/></button></div></div><div className="cart-price"><strong>{money(line.price*line.quantity)}</strong><button onClick={()=>setQuantity(line.id,0)}>Remove</button></div></div>)}</div><div className="drawer-foot"><div className="subtotal-row"><span>Subtotal</span><strong>{money(subtotal)}</strong></div><p>Delivery fee confirmed after your order. No delivery date is promised at checkout.</p><button className="button button-dark full-button" onClick={beginCheckout}>Continue to checkout <ArrowRight size={16}/></button><span className="secure-note">Secure checkout · Payment due on delivery</span></div></>}</aside></div>}
 
     {checkoutOpen&&<div className="overlay" onClick={()=>setCheckoutOpen(false)}><aside className="drawer checkout-drawer" onClick={e=>e.stopPropagation()}><div className="drawer-head"><div><span className="tiny-label">ALMOST THERE</span><h2>Checkout</h2></div><button className="icon-button" onClick={()=>setCheckoutOpen(false)} aria-label="Close checkout"><X/></button></div><div className="checkout-banner"><span><Leaf size={18}/></span><p><strong>Delivery across Uganda</strong><br/>Fee confirmed after order. Timing agreed with you.</p></div><form className="checkout-form" onSubmit={submitOrder}><label>Full name<input name="name" placeholder="Your name" required/></label><label>Email address<input type="email" name="email" placeholder="you@example.com" required/></label><label>Phone number<input type="tel" name="phone" placeholder="+256 7XX XXX XXX" required/></label><div className="form-row"><label>District<input name="district" placeholder="e.g. Wakiso" required/></label><label>City / town<input name="city" placeholder="e.g. Entebbe" required/></label></div><label>Delivery address / landmark<textarea name="address" placeholder="Help us find you" required rows={2}/></label><label>Delivery notes <span className="optional">(optional)</span><textarea name="notes" placeholder="Anything else we should know?" rows={2}/></label><fieldset><legend>How would you like to pay?</legend><label className="payment-option"><input type="radio" name="payment" checked={payment==='cash_on_delivery'} onChange={()=>setPayment('cash_on_delivery')}/><span className="payment-dot"/><span><strong>Cash on delivery</strong><small>Pay when your order arrives.</small></span><span className="payment-check"><Check size={14}/></span></label><label className="payment-option"><input type="radio" name="payment" checked={payment==='momo_sandbox'} onChange={()=>setPayment('momo_sandbox')}/><span className="payment-dot"/><span><strong>MTN MoMo <em>Sandbox demo</em></strong><small>Simulated flow · No real payment.</small></span><span className="payment-check"><Check size={14}/></span></label></fieldset><div className="checkout-total"><div><span>Subtotal</span><strong>{money(subtotal)}</strong></div><div><span>Delivery fee</span><span>Confirmed after order</span></div><div className="total-line"><span>Due {payment==='cash_on_delivery'?'on delivery':'when confirmed'}</span><strong>{money(subtotal)}<small> + delivery</small></strong></div></div><div className="setup-note"><strong>{checkoutError ? "Checkout needs attention" : "Secure order confirmation"}</strong><span>{checkoutError || (payment === "momo_sandbox" ? "Sandbox demo only. No real MoMo payment will be taken; the order remains pending." : "Your order will be saved securely. Delivery fee will be confirmed after order.")}</span></div><button className="button button-dark full-button" disabled={submitting}>{submitting ? "Placing order…" : "Place order"} <ArrowRight size={16}/></button><span className="checkout-fine">By placing your order, you agree to be contacted to confirm delivery details.</span></form></aside></div>}
   </main>;
@@ -96,5 +179,18 @@ export default function Home() {
 function ProductCard({ product, index, selected, onSelect, onAdd, added }: {product:Product;index:number;selected:string;onSelect:(id:string)=>void;onAdd:()=>void;added:boolean}) {
   const active = product.variants.find(v=>v.id===selected)||product.variants[0];
   return <article className="product-card"><div className={`product-visual ${product.tone} ${product.image ? 'has-photo' : ''}`}><span className="visual-number">0{index+1}</span>{product.image ? <img className="product-photo" src={product.image} alt={product.name} loading="lazy"/> : <><span className="visual-mark">{product.symbol}</span><div className="visual-shape shape-a"/><div className="visual-shape shape-b"/></>}<div className="visual-name">{product.name.split(' ').map(w=>w[0]).join('').toUpperCase()}</div><span className="visual-caption">NISSI · MADE IN UGANDA</span><a className="detail-link" href={`#${product.slug}`} aria-label={`More about ${product.name}`} onClick={e=>e.preventDefault()}><ArrowUpRight size={16}/></a></div><div className="product-meta"><div className="product-topline"><span>{product.category.toUpperCase()}</span><span>0{index+1}</span></div><h3>{product.name}</h3><p>{product.short}</p><label className="variant-select"><span>SIZE / FORMAT</span><select value={selected} onChange={e=>onSelect(e.target.value)} aria-label={`Choose ${product.name} size`}>{product.variants.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select><ChevronDown size={15}/></label><div className="product-bottom"><strong>{money(active.price)}</strong><button className={added?'add-button added':'add-button'} onClick={onAdd} aria-label={`Add ${product.name}, ${active.name} to bag`}>{added?<Check size={17}/>:<Plus size={17}/>}<span>{added?'Added':'Add to bag'}</span></button></div></div></article>;
+}
+
+async function syncRemoteCart(client: NonNullable<ReturnType<typeof createSupabaseBrowserClient>>, cartId: string, before: CartLine[], after: CartLine[]) {
+  const removed = before.filter(old => !after.some(line => line.variantId === old.variantId)).map(line => line.variantId);
+  if (removed.length) {
+    const { error } = await client.from('cart_items').delete().eq('cart_id', cartId).in('variant_slug', removed);
+    if (error) throw error;
+  }
+  const changed = after.filter(line => before.find(old => old.variantId === line.variantId)?.quantity !== line.quantity);
+  if (changed.length) {
+    const { error } = await client.from('cart_items').upsert(changed.map(line => ({ cart_id: cartId, variant_slug: line.variantId, quantity: line.quantity })), { onConflict: 'cart_id,variant_slug' });
+    if (error) throw error;
+  }
 }
 
