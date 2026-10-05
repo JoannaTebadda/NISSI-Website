@@ -27,13 +27,18 @@ export default function AuthPage() {
     const form = new FormData(event.currentTarget);
     const email = String(form.get('email') || '').trim();
     const password = String(form.get('password') || '');
-    const result = mode === 'sign_in'
-      ? await supabase.auth.signInWithPassword({ email, password })
-      : await supabase.auth.signUp({ email, password, options: { emailRedirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}` } });
-    setBusy(false);
-    if (result.error) { setMessage(result.error.message); return; }
-    if (mode === 'sign_up' && !result.data.session) { setMessage('Check your email to confirm your account, then sign in.'); return; }
-    window.location.assign(next);
+    try {
+      const result = mode === 'sign_in'
+        ? await supabase.auth.signInWithPassword({ email, password })
+        : await supabase.auth.signUp({ email, password, options: { emailRedirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}` } });
+      if (result.error) { setMessage(result.error.message); return; }
+      if (mode === 'sign_up' && !result.data.session) { setMessage('Check your email to confirm your account, then sign in.'); return; }
+      window.location.assign(next);
+    } catch {
+      setMessage('Could not reach the sign-in service. Check your internet connection and try again.');
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function signInWithGoogle() {
@@ -41,8 +46,13 @@ export default function AuthPage() {
     if (!supabase) { setMessage('Authentication is not configured yet. Add the Supabase URL and public publishable key to the environment.'); return; }
     setBusy(true);
     const redirectTo = `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}`;
-    const { error } = await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo } });
-    if (error) { setBusy(false); setMessage(error.message); }
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo } });
+      if (error) { setBusy(false); setMessage(error.message); }
+    } catch {
+      setBusy(false);
+      setMessage('Could not start Google sign-in. Check your internet connection and try again.');
+    }
   }
 
   return <main className="auth-page"><Link href="/" className="auth-back"><ArrowLeft size={16}/> Back to NISSI</Link><section className="auth-card"><span className="auth-mark"><Leaf size={20}/></span><div className="eyebrow"><span className="dot"/> YOUR NISSI ACCOUNT</div><h1>{mode === 'sign_in' ? 'Welcome back.' : 'Join NISSI.'}</h1><p>Sign in to place an order and keep track of your purchases.</p>{oauthError && <div className="form-message" role="alert">Google sign-in could not be completed. Please try again.</div>}

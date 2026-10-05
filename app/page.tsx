@@ -88,7 +88,21 @@ export default function Home() {
     void initialize().catch(() => {
       if (active) { publish(readLocalCart()); setCartSyncMessage('Shared cart setup is not ready yet.'); setReady(true); }
     });
-    return () => { active = false; if (channel && supabaseRef.current) void supabaseRef.current.removeChannel(channel); };
+    const refreshWhenVisible = () => {
+      const client = supabaseRef.current;
+      const cartId = remoteCartId.current;
+      if (document.visibilityState === 'visible' && client && cartId) {
+        void loadRemote(client, cartId).catch(() => active && setCartSyncMessage('Cart sync paused. Check your connection and reload to try again.'));
+      }
+    };
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener('focus', refreshWhenVisible);
+    return () => {
+      active = false;
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener('focus', refreshWhenVisible);
+      if (channel && supabaseRef.current) void supabaseRef.current.removeChannel(channel);
+    };
   }, []);
   useEffect(() => { if (ready && !remoteCartId.current) localStorage.setItem('nissi-cart', JSON.stringify(cart)); }, [cart, ready]);
   useEffect(() => { const params = new URLSearchParams(window.location.search); if (params.get('checkout') === '1') { setCheckoutOpen(true); window.history.replaceState({}, '', window.location.pathname); } }, []);

@@ -15,6 +15,8 @@ create table if not exists public.cart_items (
 );
 
 create index if not exists cart_items_cart_id_idx on public.cart_items(cart_id);
+-- Include old row values in DELETE events so Supabase can apply cart_id filters.
+alter table public.cart_items replica identity full;
 alter table public.carts enable row level security;
 alter table public.cart_items enable row level security;
 
