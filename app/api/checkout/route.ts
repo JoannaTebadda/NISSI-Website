@@ -49,7 +49,7 @@ export async function POST(request: Request) {
   const serviceRoleKey = process.env.SUPABASE_SECRET_KEY;
   if (!url || !serviceRoleKey) return NextResponse.json({ error: 'Secure checkout is not configured yet.' }, { status: 503 });
   const admin = createClient(url, serviceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } });
-  const { data: order, error: orderError } = await admin.rpc('create_order', {
+  const { data: orderData, error: orderError } = await admin.rpc('create_order', {
     p_user_id: user.id,
     p_customer_name: name,
     p_customer_email: user.email,
@@ -61,6 +61,7 @@ export async function POST(request: Request) {
     p_payment_method: method,
     p_items: [...quantities].map(([variant_slug, quantity]) => ({ variant_slug, quantity })),
   }).single();
+  const order = orderData as unknown as { id: string; order_number: string; payment_status: string; total_ugx: number } | null;
   if (orderError || !order) {
     const unavailable = orderError?.message?.toLowerCase().includes('unavailable');
     return NextResponse.json({ error: unavailable ? 'An item is unavailable in that quantity. Please review your cart.' : 'We could not place your order. Please try again.' }, { status: unavailable ? 409 : 500 });
